@@ -16,10 +16,6 @@ async def index(item_id: int):
 def index(q:int=0,m:Optional[int]=10):
     return {"product_id": q,"Op":m}
 
-@app.post("/items")
-def index():
-    return "Hello world"
-
 
 
 # fake_items_db = [{"item_name": "Foo"}, {"item_name": "Bar"}, {"item_name": "Baz"}]
