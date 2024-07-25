@@ -1,159 +1,152 @@
-from fastapi import FastAPI,Depends
-from typing import Optional
 
-app = FastAPI()
+from fastapi import APIRouter, HTTPException, Header, status
+from typing import Annotated
+from interfaces import Github_File
+import requests
+import base64
+import json
+from openai import AzureOpenAI
 
-@app.get("/")
-def index():
-    return'Hello world'
+# Endpoint and deployment configuration
+endpoint = "https://oai-prod-eastus-001.openai.azure.com/"
+deployment = "gpt-4o-code-reviewer"
 
-@app.get("/items/{item_id}")
-async def index(item_id: int):
-    return {"item_id": item_id}
+client = AzureOpenAI(
+    api_key=API_KEY,
+    api_version="2024-05-01-preview",
+    azure_endpoint=endpoint
+)
 
+router = APIRouter(
+    prefix='/commit'
+)
 
-@app.get("/items/")
-def index(q:int=0,m:Optional[int]=10):
-    return {"product_id": q,"Op":m}
-
-
-
-# fake_items_db = [{"item_name": "Foo"}, {"item_name": "Bar"}, {"item_name": "Baz"}]
-
-
-# @app.get("/items/")
-# async def read_item(skip: int = 0, limit: int = 10):
-#     return fake_items_db[skip : skip + limit]
-
-
-
-@app.get("/users/{user_id}/items/{item_id}")
-async def read_user_item(
-    user_id: int, item_id: str, q: str | None = None, short: bool = False
-):
-    item = {"item_id": item_id, "owner_id": user_id}
-    if q:
-        item.update({"q": q})
-    if not short:
-        item.update(
-            {"description": "This is an amazing item that has a long description"}
+@router.get('/')
+async def new_commit(owner: str, repo: str, branch: str, access_token: Annotated[str, Header()]):
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token is missing.",
+            headers={"WWW-Authenticate": "Basic"},
         )
-    return item
+    return {"message": "commit staged for processing."}
 
+@router.get('/changed-files')
+async def get_changed_files(owner: str, repo: str, ref: str):
+    try:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {'Access_Token'}",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
 
-# from pydantic import BaseModel
+        url = f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}"
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
 
+        commit_info = {
+            'committer_name': data['commit']['author']['name'],
+            'commit_message': data['commit']['message'],
+            'additions': data['stats']['additions'],
+            'deletions': data['stats']['deletions'],
+            'sha': data['sha'],
+        }
 
-# class Item(BaseModel):
-#     name: str
-#     description: str | None = None
-#     price: float
-#     tax: float | None = None
+        fetched_files = []
+        language = 'python'
+        review_content = f"Review the following {language} code files:\n\n"
 
+        for file in data['files']:
+            file_name = file['filename']
+            content_url = file['contents_url']
+            content_response = requests.get(content_url, headers=headers)
+            content_response.raise_for_status()
+            content_data = content_response.json()
+            github_file = Github_File(
+                file_name, base64.b64decode(content_data['content']).decode('utf-8'),
+                additions=file['additions'],
+                deletions=file['deletions'],
+                author=data['commit']['author']['name']
+            )
+            fetched_files.append(github_file)
+            review_content += f"File: {file_name}\n"
+            review_content += f"Content:\n{base64.b64decode(content_data['content']).decode('utf-8')}\n"
 
+        # Define prompts
+        prompts = [
+            {
+                "role": "system",
+                "content": """You are a Python code reviewer. Please review the following code based on the following criteria:
+                1. Basic Clarity and Structure: Assess whether the code is clear, easy to read, and logically organized. Suggest improvements to enhance its understandability and maintainability.
+                2. Commenting and Documentation: Identify areas where comments or documentation are necessary to improve understanding.
+                3. Refactoring Suggestions: Highlight opportunities for refactoring to improve readability and code structure. Recommend specific changes to make the code cleaner and more maintainable.
+                4. Naming Conventions: Evaluate the naming conventions used for variables and functions. Suggest improvements to enhance clarity and understanding.
+                5. Code Simplification: Recommend ways to simplify complex code segments to make them more readable and easier to understand.
 
+                Provide detailed suggestions and explanations for each of the above criteria, including specific line numbers where changes are needed. You must return the response strictly in JSON format.
+                """
+            },
+            {
+                "role": "system",
+                "content": """You are a Python code reviewer. Please review the following code based on the following criteria:
+                1. Basic Error Handling: Ensure that the code gracefully handles common errors and exceptions. Suggest improvements where error handling is missing or insufficient.
+                2. Detailed Exception Messages: Check if the exception messages provide sufficient details for debugging and suggest enhancements where needed.
+                3. Try-Except Blocks: Evaluate the use of try-except blocks and recommend best practices for their usage, including avoiding broad exception catches.
+                4. Resource Management: Verify that resources such as files or network connections are properly managed and closed in case of errors.
+                5. Edge Cases and Unexpected Inputs: Identify potential edge cases and unexpected inputs that could cause the code to fail. Suggest additional error handling to make the code more robust.
 
-@app.post("/items/")
-async def create_item(item: item):
-    item_dict = item.dict()
-    if item.tax:
-        price_with_tax = item.price + item.tax
-        item_dict.update({"price_with_tax": price_with_tax})
-    return item_dict
+                Provide detailed suggestions and explanations for each of the above criteria, including specific line numbers where changes are needed. You must return the response strictly in JSON format.
+                """
+            },
+            {
+                "role": "system",
+                "content": """You are a Python code reviewer. Please review the following code based on the following criteria:
+                1. Performance Bottlenecks: Identify any performance bottlenecks in the code and suggest optimizations to improve execution speed.
+                2. Algorithm Efficiency: Assess the efficiency of the algorithms used and recommend more efficient alternatives where applicable.
+                3. Resource Management: Ensure that resources such as memory and CPU are used efficiently. Suggest improvements to reduce resource consumption.
+                4. Concurrency and Parallelism: Evaluate opportunities for using concurrency or parallelism to enhance performance. Suggest specific techniques or libraries that could be used.
+                5. Code Profiling: Recommend profiling tools and techniques that could help in identifying performance issues and optimizing the code further.
 
+                Provide detailed suggestions and explanations for each of the above criteria, including specific line numbers where changes are needed. You must return the response strictly in JSON format.
+                """
+            }
+        ]
 
-class CommonParam:
-    def __init__(self,q:Optional[str]=2,skip:int=0,limit:int=0):
-        self.q=q
-        self.skip=skip
-        self.limit=limit
+        # Dictionary to hold the suggestions for JSON output
+        suggestion_contents = {}
 
-@app.get("/")
-async def read_item(commons:CommonParam=Depends(CommonParam)):
-    res = {}
-    return commons.q+commons.skip+commons.limit
-    
+        for i, prompt in enumerate(prompts):
+            completion = client.chat.completions.create(
+                model=deployment,
+                messages=[
+                    prompt,
+                    {
+                        "role": "user",
+                        "content": review_content
+                    },
+                ],
+            )
+            
+            # Extract response content and parse JSON if necessary
+            content = completion.choices[0].message.content
+            try:
+                response_json = json.loads(content)
+            except json.JSONDecodeError:
+                response_json = {"error": "Response is not in valid JSON format"}
 
+            suggestion_contents[f"review_{i+1}"] = response_json
 
-# async def common_param(q:Optional[str]=None,skip:int=0,limit:int=0):
-#     return{"q":q,'skip':skip,'limit':limit}
+        return {
+            'commit_info': commit_info,
+            'fetched_files': [f.dict() for f in fetched_files],
+            'review_content': review_content,
+            'suggestion_contents': suggestion_contents
+        }
 
-@app.get("/items")
-async def read_items(commons:dict=Depends(common_param)):
-    return commons
-
-# @app.get("/users")
-# async def get_users(commons:dict=Depends(common_param)):
-    return commons
-             
-             
-s to be removed. – 
-Bahman Eslami
- CommentedSep 27, 2020 at 11:54
-project was moved to github, but then archived by its author – 
-Alleo
- CommentedDec 12, 2020 at 19:46
-Add a comment
-27
-
-An improved version of the PabloG code for Python 2/3:
-
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-from __future__ import ( division, absolute_import, print_function, unicode_literals )
-
-import sys, os, tempfile, logging
-
-if sys.version_info >= (3,):
-    import urllib.request as urllib2
-    import urllib.parse as urlparse
-else:
-    import urllib2
-    import urlparse
-
-def download_file(url, dest=None):
-    """ 
-    Download and save a file specified by url to dest directory,
-    """
-    u = urllib2.urlopen(url)
-
-    scheme, netloc, path, query, fragment = urlparse.urlsplit(url)
-    filename = os.path.basename(path)
-    if not filename:
-        filename = 'downloaded.file'
-    if dest:
-        filename = os.path.join(dest, filename)
-
-    with open(filename, 'wb') as f:
-        meta = u.info()
-        meta_func = meta.getheaders if hasattr(meta, 'getheaders') else meta.get_all
-        meta_length = meta_func("Content-Length")
-        file_size = None
-        if meta_length:
-            file_size = int(meta_length[0])
-        print("Downloading: {0} Bytes: {1}".format(url, file_size))
-
-        file_size_dl = 0
-        block_sz = 8192
-        while True:
-            buffer = u.read(block_sz)
-            if not buffer:
-                break
-
-            file_size_dl += len(buffer)
-            f.write(buffer)
-
-            status = "{0:16}".format(file_size_dl)
-            if file_size:
-                status += "   [{0:6.2f}%]".format(file_size_dl * 100 / file_size)
-            status += chr(13)
-            print(status, end="")
-        print()
-
-    return filename
-
-if __name__ == "__main__":  # Only run if this file is called directly
-    print("Testing with 10MB download")
-    url = "http://download.thinkbroadband.com/10MB.zip"
-    filename = download_file(url)
-    print(filename)
+    except Exception as e:
+        print('error=>', e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
